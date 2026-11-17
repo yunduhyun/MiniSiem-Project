@@ -1,0 +1,491 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: mini-siem 유지용 스택 (Network, Log Bucket, Logging Setting, Read Only User)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mini-siem
+    Description: Resources Name and Bucket Name Prefix
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*$' # 버킷 이름 규칙: 소문자, 숫자, 하이픈
+    MaxLength: 20
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: VPC 대역
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.12.0/24
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: 이 기간이 지난 로그 파일은 S3에서 자동 삭제
+
+  ReaderUserName:
+    Type: String
+    Default: mini-siem-elk-reader
+    Description: ELK가 S3를 읽을 때 쓰는 읽기 전용 IAM 사용자 이름
+
+Resources:
+  # VPC 생성, EnableDnsSupport와 Hostnames를 켜야 DNS 로그를 수집할 수 있다
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  # Internet GW 생성 및 VPC와 연결
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref IGW
+
+  # Subnet 생성
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: ap-northeast-2a
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: ap-northeast-2b
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-2'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: ap-northeast-2a
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: ap-northeast-2b
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-2'
+
+  # 퍼블릭 라우팅 규칙 추가
+  # 0.0.0.0/0으로 나가는 트래픽을 IGW로 보내는 규칙
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  # 라우팅 규칙 추가 (0.0.0.0/0 -> IGW)
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment # IGW가 연결된 뒤에 경로 생성
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  # 서브넷을 라우팅 테이블에 연결
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # 비공개 라우트 테이블, NAT 경로는 임시 스택에서 추가
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # CloudTrail버킷 설정 스택을 지워도 로그 파일은 남기도록 Retain으로 설정
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+
+  # VPC Flow Logs 버킷 설정
+  VpcFlowBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-vpcflow-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+
+  # DNS Resolver 버킷 설정
+  ResolverBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-resolver-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+
+  # Waf 로그 버킷 설정
+  WafBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # WAF는 버킷 이름이 aws-waf-logs-로 시작해야 로그를 쓴다.
+      BucketName: !Sub 'aws-waf-logs-${ProjectName}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+
+  # Alb 로그 버킷 설정
+  AlbBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-alb-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # cloudtrail 서비스가 버킷에 접근하는 것을 허용
+          - Sid: AclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail'
+          # cloudtrail이 로깅을 시도할 때 AWSLogs/내계정ID/ 아래에 내 소유권의 파일 쓰기를 허용한다.
+          - Sid: Write
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail'
+
+  # VPC Flow, WAF, Resolver은 각자 S3에 직접 쓰지 않고, AWS 내부의 공용 전달 서비스를 통해
+  # 로깅을 해야함. 그것이 delivery.logs.amazonaws.com이다.
+  VpcFlowBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VpcFlowBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt VpcFlowBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: Write
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${VpcFlowBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+  ResolverBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResolverBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ResolverBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: Write
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ResolverBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  WafBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WafBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt WafBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: Write
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${WafBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ALB 액세스 로그 버킷 정책
+  # ALB 장비는 AWS가 운영하는 인프라에서 돌아가고 내 계정의 자격 증명을 갖고 있지 않다.
+  # 그래서 로그를 올릴 때도 내 계정이 아니라 AWS의 ELB 계정(서울은 600734575887)으로 요청이 온다.
+  # 외부 계정이 내 버킷에 쓰려면 버킷 정책으로 허락해야 하므로, 이 계정이
+  # AWSLogs/내계정ID/ 아래에 파일을 올리는 것만 허락한다.
+  # 다른 리전에 배포하면 계정 번호를 그 리전 값으로 바꿔야 한다.
+  # ALB 로그 설정에 접두사를 주면 경로가 달라져서 쓰기가 막힌다.
+  AlbBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AlbBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AlbWrite
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::600734575887:root
+            Action: s3:PutObject
+            Resource: !Sub '${AlbBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+
+  # CloudTrail 로깅 설정. S3 버킷에 로그를 전송한다
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy # 버킷 정책이 먼저 있어야 생성한다.
+    Properties:
+      TrailName: !Sub '${ProjectName}-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true # 다른 리전의 API 호출도 기록
+      IncludeGlobalServiceEvents: true # 로그인, IAM 같은 글로벌 서비스 이벤트 포함
+      EnableLogFileValidation: true
+
+  # VPC FLow Logs 설정. 퍼블릭 서브넷 2곳의 로그를 수집한다. 60초 간격이고, allow 및 reject 로그 수집
+  FlowLogPublicSubnet1:
+    Type: AWS::EC2::FlowLog
+    DependsOn: VpcFlowBucketPolicy # 버킷 정책이 먼저 있어야 생성.
+    Properties:
+      ResourceType: Subnet
+      ResourceId: !Ref PublicSubnet1
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !GetAtt VpcFlowBucket.Arn
+      MaxAggregationInterval: 60
+
+  FlowLogPublicSubnet2:
+    Type: AWS::EC2::FlowLog
+    DependsOn: VpcFlowBucketPolicy
+    Properties:
+      ResourceType: Subnet
+      ResourceId: !Ref PublicSubnet2
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !GetAtt VpcFlowBucket.Arn
+      MaxAggregationInterval: 60
+
+  # Route 53 Resolver 질의 로그 수집. DNS 쿼리를 저장한다.
+  # 로그를 어디로 보낼지 정함
+  ResolverQueryLogConfig:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfig
+    DependsOn: ResolverBucketPolicy # 버킷 정책이 먼저 있어야 생성
+    Properties:
+      Name: !Sub '${ProjectName}-resolver-query-log'
+      DestinationArn: !GetAtt ResolverBucket.Arn
+
+  # 위의 설정을 어느 VPC에 적용할 지 알려줌
+  ResolverQueryLogAssociation:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfigAssociation
+    Properties:
+      ResolverQueryLogConfigId: !Ref ResolverQueryLogConfig
+      ResourceId: !Ref Vpc
+
+Outputs:
+  # 임시용 스택이 가져다 쓰는 값이다. 해당 값들은 리전에서 유일해야함.
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${ProjectName}-VpcId'
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-PublicSubnet1Id'
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-PublicSubnet2Id'
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-PrivateSubnet1Id'
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-PrivateSubnet2Id'
+  PrivateRouteTableId:
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub '${ProjectName}-PrivateRouteTableId'
+  AlbBucketName:
+    Value: !Ref AlbBucket
+    Export:
+      Name: !Sub '${ProjectName}-AlbBucketName'
+  WafBucketArn:
+    Value: !GetAtt WafBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-WafBucketArn'
